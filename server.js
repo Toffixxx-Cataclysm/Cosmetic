@@ -1,8 +1,10 @@
 /**
  * Polaris Cosmetic Sync Server
  *
- * Rooms are keyed by Minecraft server address (or "singleplayer").
- * Clients share equipped cosmetic IDs and live emote playback.
+ * Peers are stored globally (by UUID + last known name) and also indexed into
+ * rooms keyed by Minecraft server address. Cosmetics sync works even when two
+ * clients compute different room keys, via periodic "sight" queries of nearby
+ * players (match by UUID or name).
  *
  * Env:
  *   PORT          - HTTP/WS port (default 3000)
@@ -18,18 +20,16 @@ const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || "0.0.0.0";
 const SYNC_TOKEN = process.env.SYNC_TOKEN || "";
 
-/** @typedef {{ uuid: string, name: string, cosmetics: number[], emote: number, updatedAt: number, ws: import("ws").WebSocket }} Peer */
-/** @type {Map<string, Map<string, Peer>>} */
+/** @typedef {{ uuid: string, name: string, cosmetics: number[], emote: number, updatedAt: number, server: string, ws: import("ws").WebSocket }} Peer */
+/** @type {Map<string, Peer>} */
+const peersByUuid = new Map();
+/** @type {Map<string, string>} name(lower) -> uuid */
+const uuidByName = new Map();
+/** @type {Map<string, Set<string>>} serverKey -> set of uuids */
 const rooms = new Map();
 
 function now() {
   return Date.now();
-}
-
-function roomOf(serverKey) {
-  const key = (serverKey || "unknown").toLowerCase();
-  if (!rooms.has(key)) rooms.set(key, new Map());
-  return rooms.get(key);
 }
 
 function sanitizeCosmetics(raw) {
@@ -56,25 +56,69 @@ function publicPeer(peer) {
   };
 }
 
-function broadcast(room, exceptUuid, payload) {
+function roomSet(serverKey) {
+  const key = (serverKey || "unknown").toLowerCase();
+  if (!rooms.has(key)) rooms.set(key, new Set());
+  return rooms.get(key);
+}
+
+function indexName(peer) {
+  const n = (peer.name || "").trim().toLowerCase();
+  if (!n) return;
+  const prev = uuidByName.get(n);
+  if (prev && prev !== peer.uuid) {
+    // Keep newest mapping.
+  }
+  uuidByName.set(n, peer.uuid);
+}
+
+function unindexName(peer) {
+  const n = (peer.name || "").trim().toLowerCase();
+  if (!n) return;
+  if (uuidByName.get(n) === peer.uuid) uuidByName.delete(n);
+}
+
+function broadcastRoom(serverKey, exceptUuid, payload) {
+  const set = rooms.get((serverKey || "").toLowerCase());
+  if (!set) return;
   const data = JSON.stringify(payload);
-  for (const peer of room.values()) {
-    if (exceptUuid && peer.uuid === exceptUuid) continue;
-    if (peer.ws.readyState === 1) peer.ws.send(data);
+  for (const uuid of set) {
+    if (exceptUuid && uuid === exceptUuid) continue;
+    const peer = peersByUuid.get(uuid);
+    if (!peer || peer.ws.readyState !== 1) continue;
+    peer.ws.send(data);
   }
 }
 
 function leave(ws) {
   const meta = ws.__polaris;
   if (!meta) return;
-  const room = rooms.get(meta.server);
-  if (!room) return;
-  const peer = room.get(meta.uuid);
-  if (!peer || peer.ws !== ws) return;
-  room.delete(meta.uuid);
-  broadcast(room, null, { type: "peer_leave", uuid: meta.uuid });
-  if (room.size === 0) rooms.delete(meta.server);
+  const peer = peersByUuid.get(meta.uuid);
+  if (!peer || peer.ws !== ws) {
+    ws.__polaris = null;
+    return;
+  }
+  peersByUuid.delete(meta.uuid);
+  unindexName(peer);
+  const set = rooms.get(meta.server);
+  if (set) {
+    set.delete(meta.uuid);
+    if (set.size === 0) rooms.delete(meta.server);
+  }
+  broadcastRoom(meta.server, null, { type: "peer_leave", uuid: meta.uuid, name: peer.name });
   ws.__polaris = null;
+}
+
+function resolvePeerRef(ref) {
+  if (!ref || typeof ref !== "object") return null;
+  const uuid = String(ref.uuid || "").toLowerCase();
+  const name = String(ref.name || "").trim().toLowerCase();
+  if (uuid && peersByUuid.has(uuid)) return peersByUuid.get(uuid);
+  if (name && uuidByName.has(name)) {
+    const id = uuidByName.get(name);
+    return peersByUuid.get(id) || null;
+  }
+  return null;
 }
 
 const server = http.createServer((req, res) => {
@@ -86,9 +130,9 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         ok: true,
         service: "polaris-cosmetic-sync",
-        version: "1.0.0",
+        version: "1.1.0",
         rooms: rooms.size,
-        peers: [...rooms.values()].reduce((n, r) => n + r.size, 0),
+        peers: peersByUuid.size,
         ws: "/ws",
       })
     );
@@ -126,7 +170,7 @@ wss.on("connection", (ws, req) => {
     JSON.stringify({
       type: "hello_ok",
       serverTime: now(),
-      protocol: 1,
+      protocol: 2,
     })
   );
 
@@ -150,15 +194,20 @@ wss.on("connection", (ws, req) => {
         return;
       }
 
-      // Replace previous socket for same uuid in room.
       if (ws.__polaris) leave(ws);
 
-      const room = roomOf(serverKey);
-      const existing = room.get(uuid);
+      const existing = peersByUuid.get(uuid);
       if (existing && existing.ws !== ws) {
         try {
           existing.ws.close(4002, "replaced");
         } catch {}
+        // Clean previous room membership without broadcasting leave yet — replaced.
+        const prevSet = rooms.get(existing.server);
+        if (prevSet) {
+          prevSet.delete(uuid);
+          if (prevSet.size === 0) rooms.delete(existing.server);
+        }
+        unindexName(existing);
       }
 
       const peer = {
@@ -167,19 +216,22 @@ wss.on("connection", (ws, req) => {
         cosmetics: sanitizeCosmetics(msg.cosmetics),
         emote: 0,
         updatedAt: now(),
+        server: serverKey,
         ws,
       };
-      room.set(uuid, peer);
+      peersByUuid.set(uuid, peer);
+      indexName(peer);
+      roomSet(serverKey).add(uuid);
       ws.__polaris = { uuid, server: serverKey };
 
-      ws.send(
-        JSON.stringify({
-          type: "snapshot",
-          server: serverKey,
-          peers: [...room.values()].filter((p) => p.uuid !== uuid).map(publicPeer),
-        })
-      );
-      broadcast(room, uuid, { type: "peer_join", peer: publicPeer(peer) });
+      const roomPeers = [];
+      for (const id of roomSet(serverKey)) {
+        if (id === uuid) continue;
+        const p = peersByUuid.get(id);
+        if (p) roomPeers.push(publicPeer(p));
+      }
+      ws.send(JSON.stringify({ type: "snapshot", server: serverKey, peers: roomPeers }));
+      broadcastRoom(serverKey, uuid, { type: "peer_join", peer: publicPeer(peer) });
       return;
     }
 
@@ -188,15 +240,16 @@ wss.on("connection", (ws, req) => {
       ws.send(JSON.stringify({ type: "error", error: "hello_required" }));
       return;
     }
-    const room = rooms.get(meta.server);
-    const peer = room && room.get(meta.uuid);
-    if (!peer) return;
+    const peer = peersByUuid.get(meta.uuid);
+    if (!peer || peer.ws !== ws) return;
 
     if (type === "state") {
+      unindexName(peer);
       peer.name = String(msg.name || peer.name).slice(0, 32);
       peer.cosmetics = sanitizeCosmetics(msg.cosmetics);
       peer.updatedAt = now();
-      broadcast(room, peer.uuid, { type: "peer_update", peer: publicPeer(peer) });
+      indexName(peer);
+      broadcastRoom(peer.server, peer.uuid, { type: "peer_update", peer: publicPeer(peer) });
       return;
     }
 
@@ -204,13 +257,28 @@ wss.on("connection", (ws, req) => {
       const emoteId = Math.trunc(Number(msg.emote) || 0);
       peer.emote = emoteId > 0 ? emoteId : 0;
       peer.updatedAt = now();
-      broadcast(room, peer.uuid, {
+      broadcastRoom(peer.server, peer.uuid, {
         type: "peer_emote",
         uuid: peer.uuid,
         name: peer.name,
         emote: peer.emote,
         updatedAt: peer.updatedAt,
       });
+      return;
+    }
+
+    // Nearby-player query: works across mismatched room keys / offline UUIDs.
+    if (type === "sight") {
+      const refs = Array.isArray(msg.players) ? msg.players : [];
+      const found = [];
+      const seen = new Set();
+      for (const ref of refs.slice(0, 64)) {
+        const p = resolvePeerRef(ref);
+        if (!p || p.uuid === peer.uuid || seen.has(p.uuid)) continue;
+        seen.add(p.uuid);
+        found.push(publicPeer(p));
+      }
+      ws.send(JSON.stringify({ type: "sight_state", peers: found }));
       return;
     }
 
